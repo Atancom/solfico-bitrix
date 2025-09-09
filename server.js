@@ -4,6 +4,11 @@ require('dotenv').config()
 const express = require('express')
 const app = express()
 app.use(express.json())
+// Endpoint público de salud (no pide clave)
+// Cualquiera que visite /ping recibe "ok"
+app.get('/ping', (req, res) => {
+  res.type('text').send('ok')
+})
 
 // ---------- Seguridad ----------
 const API_KEY = process.env.API_KEY
