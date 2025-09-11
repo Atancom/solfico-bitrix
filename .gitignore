@@ -1,0 +1,19 @@
+# Dependencias
+node_modules/
+
+# Archivos de logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Entornos
+.env
+
+# Cache y compilados
+dist/
+build/
+.cache/
+
+# Sistema
+.DS_Store
+Thumbs.db
