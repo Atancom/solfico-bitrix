@@ -4,8 +4,11 @@ require('dotenv').config()
 const express = require('express')
 const app = express()
 app.use(express.json())
+
+// Nota: en Node 18+ existe fetch global. Si tu runtime no lo tiene,
+// usa node 18 en Render o añade un polyfill de fetch.
+
 // Endpoint público de salud (no pide clave)
-// Cualquiera que visite /ping recibe "ok"
 app.get('/ping', (req, res) => {
   res.type('text').send('ok')
 })
@@ -14,7 +17,9 @@ app.get('/ping', (req, res) => {
 const API_KEY = process.env.API_KEY
 console.log('API_KEY cargada:', API_KEY)
 
+// Todas las rutas bajo /api requieren Authorization: Bearer <API_KEY>
 app.use('/api', (req, res, next) => {
+  if (!API_KEY) return res.status(500).json({ error: 'Falta API_KEY en el servidor' })
   const auth = req.headers.authorization || ''
   if (!auth.startsWith('Bearer ') || auth.slice(7) !== API_KEY) {
     return res.status(401).json({ error: 'Unauthorized' })
@@ -25,6 +30,7 @@ app.use('/api', (req, res, next) => {
 // ---------- Helper Bitrix ----------
 async function bitrix(method, params = {}) {
   const base = process.env.BITRIX_WEBHOOK_BASE // debe terminar en /
+  if (!base) throw new Error('Falta BITRIX_WEBHOOK_BASE en .env')
   const url = `${base}${method}.json`
   const r = await fetch(url, {
     method: 'POST',
@@ -33,7 +39,22 @@ async function bitrix(method, params = {}) {
   })
   const j = await r.json()
   if (j.error) throw new Error(j.error_description || j.error)
-  return j.result
+  return j.result // SOLO result
+}
+
+// Cuando necesitamos paginación (necesitamos también "next"), usamos este:
+async function bitrixRaw(method, params = {}) {
+  const base = process.env.BITRIX_WEBHOOK_BASE // debe terminar en /
+  if (!base) throw new Error('Falta BITRIX_WEBHOOK_BASE en .env')
+  const url = `${base}${method}.json`
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params)
+  })
+  const j = await r.json()
+  if (j.error) throw new Error(j.error_description || j.error)
+  return j // JSON completo (incluye next)
 }
 
 const firstValue = arr => (Array.isArray(arr) && arr[0] && arr[0].VALUE) || ''
@@ -47,40 +68,35 @@ const joinAddress = c => [
   c.ADDRESS_COUNTRY
 ].filter(Boolean).join(', ')
 
-// ---------- Endpoints básicos ----------
+// ---------- Endpoints básicos existentes ----------
 app.get('/api/hello', (req, res) => {
   res.json({ msg: 'Hola Ana, el servidor funciona 🎉' })
 })
 
-// ---------- Búsqueda parcial: TODAS normalizadas ----------
+// Búsqueda parcial: TODAS normalizadas
 app.get('/api/bitrix/companies/search/normalized', async (req, res) => {
   try {
     const name = (req.query.name || '').trim()
     if (!name) return res.status(400).json({ error: 'Falta el parámetro ?name=' })
 
-    // 1) Buscar todas las compañías cuyo TITLE contenga "name"
+    // 1) Buscar IDs
     const matches = await bitrix('crm.company.list', {
-      filter: { '%TITLE': name },    // coincidencia parcial
-      select: ['ID']                 // primero solo IDs
+      filter: { '%TITLE': name },
+      select: ['ID']
     })
     if (!matches || matches.length === 0) {
       return res.status(404).json({ error: `No se encontraron compañías que contengan: ${name}` })
     }
 
-    // 2) Para cada compañía: detalle + contactos + (intento) requisitos
+    // 2) Para cada compañía: detalle + contactos + requisitos
     const results = await Promise.all(matches.map(async item => {
       const id = item.ID
-
-      // Detalle completo
       const company = await bitrix('crm.company.get', { ID: id })
-
-      // Contactos
       const rel = await bitrix('crm.company.contact.items.get', { ID: id })
       const contacts = await Promise.all((rel || []).map(c =>
         bitrix('crm.contact.get', { ID: c.CONTACT_ID })
       ))
 
-      // Requisitos fiscales (si existen)
       let legal = { legalName: '', vatNumber: '' }
       try {
         const reqs = await bitrix('crm.requisite.list', { filter: { ENTITY_TYPE_ID: 4, ENTITY_ID: id } })
@@ -93,7 +109,6 @@ app.get('/api/bitrix/companies/search/normalized', async (req, res) => {
         }
       } catch (_) {}
 
-      // Normalizar
       return {
         company: {
           id: String(company.ID),
@@ -117,6 +132,125 @@ app.get('/api/bitrix/companies/search/normalized', async (req, res) => {
     }))
 
     res.json(results)
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+/* ============================================================
+   NUEVO: ENDPOINTS para que GPT vea TODOS los campos
+   - Compañías
+   - Negociaciones (Deals)
+   - SPAs (Smart Process): lista y campos por tipo
+============================================================ */
+
+// ===== COMPAÑÍAS =====
+app.get('/api/bitrix/company/fields', async (req, res) => {
+  try {
+    const result = await bitrix('crm.company.fields')
+    res.json({ result })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/bitrix/company/userfields', async (req, res) => {
+  try {
+    let start = 0, all = []
+    while (true) {
+      const data = await bitrixRaw('crm.company.userfield.list', { order: { ID: 'ASC' }, start })
+      const items = Array.isArray(data.result) ? data.result : []
+      all = all.concat(items)
+      if (data.next == null) break
+      start = data.next
+    }
+    res.json({ result: all })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ===== NEGOCIACIONES (DEALS) =====
+app.get('/api/bitrix/deal/fields', async (req, res) => {
+  try {
+    const result = await bitrix('crm.deal.fields')
+    res.json({ result })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/bitrix/deal/userfields', async (req, res) => {
+  try {
+    let start = 0, all = []
+    while (true) {
+      const data = await bitrixRaw('crm.deal.userfield.list', { order: { ID: 'ASC' }, start })
+      const items = Array.isArray(data.result) ? data.result : []
+      all = all.concat(items)
+      if (data.next == null) break
+      start = data.next
+    }
+    res.json({ result: all })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/bitrix/deal/userfields/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'id inválido' })
+    const result = await bitrix('crm.deal.userfield.get', { id })
+    res.json({ result })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ===== SPAs =====
+app.get('/api/bitrix/types', async (req, res) => {
+  try {
+    let start = 0, all = []
+    while (true) {
+      const data = await bitrixRaw('crm.type.list', { start })
+      const result = data.result || {}
+      const types = Array.isArray(result.types) ? result.types
+                  : (Array.isArray(result) ? result : [])
+      all = all.concat(types)
+      const next = data.next || (result && result.next)
+      if (next == null) break
+      start = next
+    }
+    res.json({ result: all })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/bitrix/types/:id/fields', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'entityTypeId inválido' })
+    const result = await bitrix('crm.item.fields', { entityTypeId: id })
+    res.json({ result })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+app.get('/api/bitrix/types/:id/userfields', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'entityTypeId inválido' })
+    let start = 0, all = []
+    while (true) {
+      const data = await bitrixRaw('crm.item.userfield.list', { entityTypeId: id, order: { ID: 'ASC' }, start })
+      const items = Array.isArray(data.result) ? data.result : []
+      all = all.concat(items)
+      if (data.next == null) break
+      start = data.next
+    }
+    res.json({ result: all })
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
