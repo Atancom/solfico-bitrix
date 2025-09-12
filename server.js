@@ -138,10 +138,7 @@ app.get('/api/bitrix/companies/search/normalized', async (req, res) => {
 })
 
 /* ============================================================
-   NUEVO: ENDPOINTS para que GPT vea TODOS los campos
-   - Compañías
-   - Negociaciones (Deals)
-   - SPAs (Smart Process): lista y campos por tipo
+   ENDPOINTS de campos (nativos + UF por separado)
 ============================================================ */
 
 // ===== COMPAÑÍAS =====
@@ -251,6 +248,142 @@ app.get('/api/bitrix/types/:id/userfields', async (req, res) => {
       start = data.next
     }
     res.json({ result: all })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+/* ============================================================
+   DICCIONARIOS EN VIVO (nativos + UF + opciones)
+   - /api/dict/company
+   - /api/dict/deal
+   - /api/dict/spas
+   - /api/dict/spa/:id
+============================================================ */
+
+// Normaliza un campo a un formato común
+function normalizeField(code, f, source) {
+  return {
+    code,
+    title: f.title || f.editFormLabel || f.listLabel || f.formLabel || f.COLUMN_NAME || code,
+    type: f.type || f.DATA_TYPE || f.userTypeId || f.USER_TYPE_ID || f.userType || '',
+    multiple: Boolean(f.multiple || f.MULTIPLE === 'Y'),
+    mandatory: Boolean(f.isRequired || f.MANDATORY === 'Y'),
+    source // 'native' | 'uf'
+  }
+}
+
+// Añade opciones si el campo es enumeration
+function attachOptions(row, f) {
+  const list = f.LIST || f.enum || f.items || []
+  if (Array.isArray(list) && list.length) {
+    row.options = list.map(o => {
+      const id = o.ID ?? o.id ?? o.VALUE ?? ''
+      const val = o.VALUE ?? o.value ?? ''
+      return `${id}:${val}`
+    }).join(' | ')
+  } else {
+    row.options = ''
+  }
+  return row
+}
+
+// ---- COMPANY dict ----
+app.get('/api/dict/company', async (req, res) => {
+  try {
+    const native = await bitrix('crm.company.fields') // { CODE: {...} }
+    const rows = Object.entries(native).map(([code, f]) =>
+      attachOptions(normalizeField(code, f, 'native'), f)
+    )
+
+    let start = 0
+    while (true) {
+      const page = await bitrixRaw('crm.company.userfield.list', { order:{ID:'ASC'}, start })
+      const items = Array.isArray(page.result) ? page.result : []
+      for (const uf of items) {
+        const code = uf.FIELD_NAME || uf.FIELD
+        const row = attachOptions(normalizeField(code, uf, 'uf'), uf)
+        rows.push(row)
+      }
+      if (page.next == null) break
+      start = page.next
+    }
+    res.json({ result: rows })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ---- DEAL dict ----
+app.get('/api/dict/deal', async (req, res) => {
+  try {
+    const native = await bitrix('crm.deal.fields')
+    const rows = Object.entries(native).map(([code, f]) =>
+      attachOptions(normalizeField(code, f, 'native'), f)
+    )
+
+    let start = 0
+    while (true) {
+      const page = await bitrixRaw('crm.deal.userfield.list', { order:{ID:'ASC'}, start })
+      const items = Array.isArray(page.result) ? page.result : []
+      for (const uf of items) {
+        const code = uf.FIELD_NAME || uf.FIELD
+        const row = attachOptions(normalizeField(code, uf, 'uf'), uf)
+        rows.push(row)
+      }
+      if (page.next == null) break
+      start = page.next
+    }
+    res.json({ result: rows })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ---- SPAs dict: lista
+app.get('/api/dict/spas', async (req, res) => {
+  try {
+    let start = 0, all = []
+    while (true) {
+      const data = await bitrixRaw('crm.type.list', { start })
+      const result = data.result || {}
+      const types = Array.isArray(result.types) ? result.types
+                  : (Array.isArray(result) ? result : [])
+      all = all.concat(types)
+      const next = data.next || (result && result.next)
+      if (next == null) break
+      start = next
+    }
+    res.json({ result: all.map(t => ({ id: t.entityTypeId, title: t.title, code: t.code })) })
+  } catch (e) {
+    res.status(500).json({ error: e.message })
+  }
+})
+
+// ---- SPA dict por entityTypeId
+app.get('/api/dict/spa/:id', async (req, res) => {
+  try {
+    const id = Number(req.params.id)
+    if (!Number.isFinite(id)) return res.status(400).json({ error: 'entityTypeId inválido' })
+
+    const native = await bitrix('crm.item.fields', { entityTypeId: id })
+    const rows = Object.entries(native).map(([code, f]) =>
+      attachOptions(normalizeField(code, f, 'native'), f)
+    )
+
+    let start = 0
+    while (true) {
+      const page = await bitrixRaw('crm.item.userfield.list', { entityTypeId: id, order:{ID:'ASC'}, start })
+      const items = Array.isArray(page.result) ? page.result : []
+      for (const uf of items) {
+        const code = uf.FIELD_NAME || uf.FIELD
+        const row = attachOptions(normalizeField(code, uf, 'uf'), uf)
+        rows.push(row)
+      }
+      if (page.next == null) break
+      start = page.next
+    }
+    res.json({ result: rows })
   } catch (e) {
     res.status(500).json({ error: e.message })
   }
